@@ -7,6 +7,7 @@ This is the code used in the Research Project to quantify the endogenous shifts 
     ```
     git clone https://github.com/carla-recourse/CARLA.git
     ```
+Note: This will be removed in a future commit when a bug specific to REVISE is fixed in the CARLA library 
 
 2. Build the Docker image defined in the `Dockerfile`:
 
