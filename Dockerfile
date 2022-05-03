@@ -11,4 +11,4 @@ RUN pip install -U pip setuptools wheel
 RUN pip install -e .
 
 WORKDIR /code
-CMD [ "python3", "main.py" ]
+ENTRYPOINT [ "python3", "main.py" ]
