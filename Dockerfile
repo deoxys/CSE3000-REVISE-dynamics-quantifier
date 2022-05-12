@@ -9,6 +9,7 @@ COPY CARLA CARLA
 WORKDIR /code/CARLA
 RUN pip install -U pip setuptools wheel
 RUN pip install -e .
+RUN pip install kneed
 
 WORKDIR /code
 ENTRYPOINT [ "python3", "main.py" ]
