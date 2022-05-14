@@ -53,6 +53,8 @@ def create_dataset(dataset_name, num):
 
 
     plt.scatter(df["feature 1"].tolist(), df["feature 2"].tolist(), c=label)
+    plt.xlabel("Feature 1")
+    plt.ylabel("Feature 2")
     plt.savefig(f"{dataset_name}_scatterplot.png")
 
     df["class"] = label
@@ -73,9 +75,6 @@ def normalize_dataset(dataset, features):
 def read_dataset(filename):
     dataset = pd.read_csv(filename)
     features = dataset.columns.tolist()[0:-1]
-    plt.scatter(dataset["feature 1"].tolist(), dataset["feature 2"].tolist(), c=dataset["class"])
-    plt.savefig(f"{filename}_scatterplot.png")
-    plt.close()
     return (dataset, features)
 
 
@@ -173,7 +172,6 @@ def kmeans(df):
 
     kn = KneeLocator(x, ssd, curve='convex', direction='decreasing')
     logger.debug(f"\'Optimal\' amount of clusters found: {kn.knee}")
-    logger.debug(f"Cluster centers: {centers[kn.knee-1]}")
 
     return pd.DataFrame(centers[kn.knee-1])
 
@@ -182,45 +180,42 @@ def kmeans(df):
 def measurements(dataset, filename, counterfactuals, features, round, name):
 
     res = {"Count": counterfactuals.shape[0]}
-    df = dataset.df.drop(columns=[dataset.target] ,inplace=False)
+
+    negative = dataset._df[dataset._df[dataset.target] == 0]
+    positive = dataset._df[dataset._df[dataset.target] == 1]
+
 
     # calc mean, cov ...
+    print(negative)
     for x in features:
-        res[f"mean {x}"] = df[x].mean()
-        res[f"mean {x}"] = df[x].median()
+        res[f"mean negative {x}"] = negative[x].mean()
+        res[f"mean positive {x}"] = positive[x].mean()
+        res[f"median negative {x}"] = negative[x].median()
+        res[f"median positive {x}"] = positive[x].median()
 
+    df = dataset.df.drop(columns=[dataset.target] ,inplace=False)
     kmeans_centers = kmeans(df)
 
     print(kmeans_centers)
 
     fig, ax = plt.subplots()
     plt.scatter(dataset._df["feature 1"].tolist(), dataset._df["feature 2"].tolist(), c=dataset._df["class"])
-
     kmeans_centers.plot.scatter(x=0, y=1, ax=ax, marker="*", c="red")
+    ax.set_title(f'Scatterplot {filename} {name} {round}')
+    ax.set_xlabel("Feature 1")
+    ax.set_ylabel("Feature 2")
     plt.savefig(f"{filename}_{name}_{round}_clusters.png")
     plt.close()
 
-    kmeans_centers.to_csv(f'{filename}_{name}_{round}_kmeans_centers_{datetime.datetime.now().strftime("%d-%b-%Y (%H.%M.%S)")}.csv', sep=',', encoding='utf-8', index=False)
-    df.cov().to_csv(f'{filename}_{name}_{round}_cov{datetime.datetime.now().strftime("%d-%b-%Y (%H.%M.%S)")}.csv', sep=',', encoding='utf-8', index=False)
+    kmeans_centers.to_csv(f'{filename}_{name}_{round}_kmeans_centers.csv', sep=',', encoding='utf-8', index=False)
+    df.cov().to_csv(f'{filename}_{name}_{round}_cov.csv', sep=',', encoding='utf-8', index=False)
 
     logger.debug(f"{name} {res}")
     return pd.Series(res)
 
 
-def run_rounds(df_res, rounds, batch, model, dataset, factuals, recourse_function, recourse_name, filename):
-    kmeans_centers = kmeans(dataset.df.drop(columns=[dataset.target] ,inplace=False))
-
-    print(kmeans_centers)
-
-    fig, ax = plt.subplots()
-    plt.scatter(dataset._df["feature 1"].tolist(), dataset._df["feature 2"].tolist(), c=dataset._df["class"])
-
-    kmeans_centers.plot.scatter(x=0, y=1, ax=ax, marker="*", c="red")
-    plt.savefig(f"{recourse_name}_{filename}_clusters.png")
-    plt.close()
-
-    
-    for i in range(rounds):
+def run_rounds(df_res, rounds, batch, model, dataset, factuals, recourse_function, recourse_name, filename):    
+    for i in range(1, rounds+1):
         recourse = recourse_function(dataset, "custom", model)
 
         # ensure that the model is adequate by catching the error that is thrown when the model is bad.
@@ -288,14 +283,19 @@ def main():
 
         dataset, model, features = load_custom_dataset_model(args.model)
 
+        df_revise = pd.DataFrame()
+        df_wachter = pd.DataFrame()
+        res = measurements(dataset, args.model, pd.DataFrame(), features, round=0, name="Start")
+
+        df_revise = df_revise.append(res, ignore_index=True)
+        df_wachter = df_wachter.append(res, ignore_index=True)
 
         logger.debug("starting revise")
         dataset_revise = copy.copy(dataset)
         model_revise = copy.copy(model)
-        df_revise = pd.DataFrame()
         revise_factuals = get_factuals(model_revise, dataset_revise)
         df_revise = run_rounds(df_revise, args.rounds, args.batch, model_revise, dataset_revise, revise_factuals, load_revise, "REVISE", args.model)
-        df_revise.to_csv(f'df_revise_{datetime.datetime.now().strftime("%d-%b-%Y (%H.%M.%S)")}.csv', sep=',', encoding='utf-8', index=False)
+        df_revise.to_csv(f'df_revise_{args.model}.csv', sep=',', encoding='utf-8', index=False)
         logger.debug("done with revise")
 
 
@@ -304,10 +304,9 @@ def main():
         logger.debug("starting wachter")
         dataset_wachter = copy.copy(dataset)
         model_wachter = copy.copy(model)
-        df_wachter = pd.DataFrame()
         wachter_factuals = get_factuals(model_wachter, dataset_wachter)
         df_wachter = run_rounds(df_wachter, args.rounds, args.batch, model_wachter, dataset_wachter, wachter_factuals, load_wachter, "Wachter", args.model)
-        df_wachter.to_csv(f'df_wachter_{datetime.datetime.now().strftime("%d-%b-%Y (%H.%M.%S)")}.csv', sep=',', encoding='utf-8', index=False)
+        df_wachter.to_csv(f'df_wachter_{args.model}.csv', sep=',', encoding='utf-8', index=False)
         logger.debug("done with wachter")
 
         end = time.time()
