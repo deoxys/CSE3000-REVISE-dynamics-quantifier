@@ -13,6 +13,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 from carla.data.catalog import OnlineCatalog, CsvCatalog
 from carla import MLModelCatalog
+from custom_model import CustomModel
 from carla.recourse_methods import Revise
 from carla.recourse_methods import Wachter
 from carla.models.negative_instances import predict_negative_instances
@@ -75,23 +76,30 @@ def normalize_dataset(dataset, features):
 def read_dataset(filename):
     dataset = pd.read_csv(filename)
     features = dataset.columns.tolist()[0:-1]
+    dataset.index.name = 'factual_id'
     return (dataset, features)
 
 
 def load_custom_dataset_model(filename):
 
     dataset, features = read_dataset(filename)
-    dataset.index.name = 'factual_id'
     dataset = CsvCatalog(file_path=filename, continuous=features, categorical=[], immutables=[], target="class")
-    model = MLModelCatalog(dataset, "ann", backend="pytorch", load_online=False, cache=False)
+    model = CustomModel(dataset, model_type="ann", backend="pytorch", load_online=False, cache=False)
     model.train(
         learning_rate=training_params["lr"],
         epochs=training_params["epochs"],
         batch_size=training_params["batch_size"],
         hidden_size=training_params["hidden_size"],
-        force_train=True
-    )
-
+        )
+    while (model.get_test_accuracy() < 0.8):
+        logger.debug(f'model accuracy was below the set threshold: {model.get_test_accuracy()}')
+        model.train(
+        learning_rate=training_params["lr"],
+        epochs=training_params["epochs"],
+        batch_size=training_params["batch_size"],
+        hidden_size=training_params["hidden_size"],
+        )
+    logger.debug(f'model accuracy: {model.get_test_accuracy()}')
     return (dataset, model, features)
 
 
@@ -146,7 +154,7 @@ def run_recourse_method(factuals, recourse_method, recourse_name):
     end = time.time()
     
     count = counterfactuals.dropna(inplace=False)
-    print(count)
+    # print(count)
     count = counterfactuals.shape[0]
     logger.debug(f"It took {end-start:.2f} seconds to find {count} counterfactuals for {recourse_name}")
     return (counterfactuals, count)
@@ -177,16 +185,16 @@ def kmeans(df):
 
 
 
-def measurements(dataset, filename, counterfactuals, features, round, name):
+def measurements(model, dataset, filename, counterfactuals, features, round, name):
 
-    res = {"Count": counterfactuals.shape[0]}
+    res = {"Count": counterfactuals.shape[0], "Accuracy": model.get_test_accuracy()}
 
     negative = dataset._df[dataset._df[dataset.target] == 0]
     positive = dataset._df[dataset._df[dataset.target] == 1]
 
 
     # calc mean, cov ...
-    print(negative)
+    # print(negative)
     for x in features:
         res[f"mean negative {x}"] = negative[x].mean()
         res[f"mean positive {x}"] = positive[x].mean()
@@ -196,7 +204,7 @@ def measurements(dataset, filename, counterfactuals, features, round, name):
     df = dataset.df.drop(columns=[dataset.target] ,inplace=False)
     kmeans_centers = kmeans(df)
 
-    print(kmeans_centers)
+    # print(kmeans_centers)
 
     fig, ax = plt.subplots()
     plt.scatter(dataset._df["feature 1"].tolist(), dataset._df["feature 2"].tolist(), c=dataset._df["class"])
@@ -218,20 +226,12 @@ def run_rounds(df_res, rounds, batch, model, dataset, factuals, recourse_functio
     for i in range(1, rounds+1):
         recourse = recourse_function(dataset, "custom", model)
 
-        # ensure that the model is adequate by catching the error that is thrown when the model is bad.
-        tries = 0
-        while tries < 10:
-            try:
-                (counterfactuals, count) = run_recourse_method(factuals, recourse, recourse_name)
-                break
-            except ValueError:
-                tries += 1
-                logger.warning(f"retrying retrieval of counterfactuals because of an error with the model: {tries}")
-        
-        if tries == 10:
-            raise RuntimeError('Model failed to load correctly after 10 tries.') from None
+        try:
+            (counterfactuals, count) = run_recourse_method(factuals, recourse, recourse_name)
+        except ValueError:
+            logger.error(f"retrying retrieval of counterfactuals because of an error with the model")
 
-        print(count)
+        # print(count)
         counterfactuals["factual_id"] = factuals.index
         counterfactuals.set_index("factual_id", inplace=True, drop=True)
         counterfactuals.dropna(inplace=True)
@@ -252,9 +252,17 @@ def run_rounds(df_res, rounds, batch, model, dataset, factuals, recourse_functio
         else:
             logger.debug(f"not enough counterfactuals to use with {recourse_name} to complete all rounds")
 
-        dataset, model, features = load_custom_dataset_model(f"{filename}-{recourse_name}-{i}")
 
-        res = measurements(dataset, filename, counterfactuals, features, round=i, name=recourse_name)
+        dataset, features = read_dataset(f"{filename}-{recourse_name}-{i}")
+        dataset = CsvCatalog(file_path=f"{filename}-{recourse_name}-{i}", continuous=features, categorical=[], immutables=[], target="class")
+        model.train(
+            learning_rate=training_params["lr"],
+            epochs=training_params["epochs"],
+            batch_size=training_params["batch_size"],
+            hidden_size=training_params["hidden_size"],
+        )
+
+        res = measurements(model, dataset, filename, counterfactuals, features, round=i, name=recourse_name)
         df_res = df_res.append(res, ignore_index=True)
         factuals = get_factuals(model, dataset)
     
@@ -282,28 +290,26 @@ def main():
         logger.debug("process started")
 
         dataset, model, features = load_custom_dataset_model(args.model)
+        logger.debug(hash(model))
 
         df_revise = pd.DataFrame()
         df_wachter = pd.DataFrame()
-        res = measurements(dataset, args.model, pd.DataFrame(), features, round=0, name="Start")
+        res = measurements(model, dataset, args.model, pd.DataFrame(), features, round=0, name="Start")
 
         df_revise = df_revise.append(res, ignore_index=True)
         df_wachter = df_wachter.append(res, ignore_index=True)
 
         logger.debug("starting revise")
-        dataset_revise = copy.copy(dataset)
-        model_revise = copy.copy(model)
+        dataset_revise = copy.deepcopy(dataset)
+        model_revise = copy.deepcopy(model)
         revise_factuals = get_factuals(model_revise, dataset_revise)
         df_revise = run_rounds(df_revise, args.rounds, args.batch, model_revise, dataset_revise, revise_factuals, load_revise, "REVISE", args.model)
         df_revise.to_csv(f'df_revise_{args.model}.csv', sep=',', encoding='utf-8', index=False)
         logger.debug("done with revise")
 
-
-        dataset, model, _ = load_custom_dataset_model(args.model)
-
         logger.debug("starting wachter")
-        dataset_wachter = copy.copy(dataset)
-        model_wachter = copy.copy(model)
+        dataset_wachter = copy.deepcopy(dataset)
+        model_wachter = copy.deepcopy(model)
         wachter_factuals = get_factuals(model_wachter, dataset_wachter)
         df_wachter = run_rounds(df_wachter, args.rounds, args.batch, model_wachter, dataset_wachter, wachter_factuals, load_wachter, "Wachter", args.model)
         df_wachter.to_csv(f'df_wachter_{args.model}.csv', sep=',', encoding='utf-8', index=False)
@@ -311,6 +317,7 @@ def main():
 
         end = time.time()
 
+        logger.debug(hash(model))
         logger.debug(f"whole process took: {end-start} seconds.")
 
     if not args.custom:
