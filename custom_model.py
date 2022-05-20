@@ -4,13 +4,11 @@ from typing import Any, List, Union
 import numpy as np
 import pandas as pd
 import torch
-import xgboost
-from sklearn.ensemble import RandomForestClassifier
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from sklearn.metrics import f1_score
 
-
-from carla.models.catalog.load_model import load_online_model, load_trained_model, save_model
+from carla.models.catalog.load_model import save_model
 from carla.models.catalog.train_model import train_model, _training_torch, DataFrameDataset
 
 class CustomModel(MLModel):
@@ -192,6 +190,15 @@ class CustomModel(MLModel):
         correct = prediction == y_test
         return correct.mean()
 
+    def get_F1_score(self):
+        df_test = self.data.df_test
+
+        x_test = df_test[list(set(df_test.columns) - {self.data.target})]
+        y_test = df_test[self.data.target]
+
+        prediction = (self.predict(x_test) > 0.5).flatten()
+
+        return f1_score(y_test, prediction)
 
     def train(
     self,
@@ -201,6 +208,7 @@ class CustomModel(MLModel):
     hidden_size=[18, 9, 3],
     n_estimators=5,
     max_depth=5,
+    force_train=False
     ):
         """
         Parameters
@@ -245,7 +253,7 @@ class CustomModel(MLModel):
         x_test = self.get_ordered_features(x_test)
 
         # if model loading failed or force_train flag set to true.
-        if self._model is None:
+        if self._model is None or force_train:
             self._model = train_model(
                 self,
                 x_train,
