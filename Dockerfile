@@ -11,5 +11,12 @@ RUN pip install -U pip setuptools wheel
 RUN pip install -e .
 RUN pip install kneed
 
+RUN git clone https://github.com/skorch-dev/skorch.git
+WORKDIR skorch
+# create and activate a virtual environment
+RUN python -m pip install -r requirements.txt
+# install pytorch version for your system (see below)
+RUN python -m pip install .
+
 WORKDIR /code
 ENTRYPOINT [ "python3", "main.py" ]

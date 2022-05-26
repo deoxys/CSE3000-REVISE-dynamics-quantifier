@@ -1,5 +1,6 @@
 # from asyncore import file_dispatcher
 # from fileinput import filename
+from dis import dis
 import warnings
 import os
 import datetime
@@ -20,6 +21,7 @@ from carla.models.negative_instances import predict_negative_instances
 
 from scipy.special import rel_entr
 from sklearn.datasets import make_classification
+from sklearn.metrics import classification_report
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -27,6 +29,12 @@ import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.cluster import KMeans
 from kneed import KneeLocator
+
+from carla.models.catalog.ANN_TORCH import AnnModel as ann_torch
+# from custom_model_ann import CustomAnnModel as ann_torch
+
+from sklearn.model_selection import GridSearchCV
+from skorch import NeuralNetClassifier
 
 from itertools import combinations
 
@@ -42,23 +50,21 @@ fh.setFormatter(formatter)
 fh.setLevel(logging.DEBUG)
 logger.addHandler(fh)
 
-training_params = {"lr": 0.005, "epochs": 10, "batch_size": 1, "hidden_size": [4]}
-
 def create_dataset(dataset_name, num):
     dataset, label = make_classification(n_samples=num, n_features=2, n_informative=2, n_redundant=0, n_clusters_per_class=1, flip_y=0, class_sep=2)
 
-    feature_labels = ["feature 1", "feature 2"]
+    feature_labels = ["feature1", "feature2"]
 
     df = pd.DataFrame(dataset, columns=feature_labels)
     df = normalize_dataset(df, feature_labels)
 
 
-    plt.scatter(df["feature 1"].tolist(), df["feature 2"].tolist(), c=label)
-    plt.xlabel("Feature 1")
-    plt.ylabel("Feature 2")
+    plt.scatter(df["feature1"].tolist(), df["feature2"].tolist(), c=label)
+    plt.xlabel("Feature1")
+    plt.ylabel("Feature2")
     plt.savefig(f"{dataset_name}_scatterplot.png")
 
-    df["class"] = label
+    df["target"] = label
 
     df.to_csv(dataset_name, sep=',', encoding='utf-8', index=False)
 
@@ -83,24 +89,44 @@ def read_dataset(filename):
 def load_custom_dataset_model(filename):
 
     dataset, features = read_dataset(filename)
-    dataset = CsvCatalog(file_path=filename, continuous=features, categorical=[], immutables=[], target="class")
-    model = CustomModel(dataset, model_type="ann", backend="pytorch", load_online=False, cache=False)
+    dataset = CsvCatalog(file_path=filename, continuous=features, categorical=[], immutables=[], target="target")
+
+    net = NeuralNetClassifier(
+        module=ann_torch,
+        module__input_layer=len(dataset._df_test.columns)-1,
+        module__hidden_layers=[4],
+        module__num_of_classes=2,
+        lr=0.01,
+        # Shuffle training data on each epoch
+        iterator_train__shuffle=True,
+    )
+
+    parameters = {
+        'lr': [0.005, 0.01, 0.02, 0.05, 0.1],
+        'max_epochs': [10, 20, 30, 40, 50],
+        'batch_size': [1, 5, 10, 20, 40]
+    }
+
+    global gs
+    gs = GridSearchCV(estimator=net, param_grid=parameters, cv=2, scoring='accuracy', verbose=0, n_jobs=-1)
+    
+    X = dataset._df_train[list(set(dataset._df_train.columns) - {dataset.target})]
+    y = dataset._df_train[dataset.target]
+
+    gs.fit(np.array(X, dtype=np.float32), y)
+
+    logger.debug(f"Best parameters set found on development set: {gs.best_params_}")
+
+    model = CustomModel(dataset, model_type="ann", backend="pytorch", load_online=False, cache=False, hidden_size=[4])
+
+    # logger.debug(classification_report(y_true, y_pred))
+
     model.train(
-        learning_rate=training_params["lr"],
-        epochs=training_params["epochs"],
-        batch_size=training_params["batch_size"],
-        hidden_size=training_params["hidden_size"],
-        )
-    while (model.get_test_accuracy() < 0.8):
-        logger.debug(f'model accuracy was below the set threshold: {model.get_test_accuracy()}')
-        model.train(
-        learning_rate=training_params["lr"],
-        epochs=training_params["epochs"],
-        batch_size=training_params["batch_size"],
-        hidden_size=training_params["hidden_size"],
-        force_train=True
-        )
-    logger.debug(f'model accuracy: {model.get_test_accuracy()}')
+        learning_rate=gs.best_params_['lr'],
+        epochs=gs.best_params_['max_epochs'],
+        batch_size=gs.best_params_['batch_size'],
+    )
+
     return (dataset, model, features)
 
 
@@ -115,6 +141,7 @@ def load_revise(dataset, dataset_name, model):
     hyperparams = {
         "data_name": dataset_name, 
         "vae_params": {
+            "train": False,
             "layers": [len(model.feature_input_order), 512, 256, 8],
         }
     }
@@ -131,7 +158,7 @@ def load_wachter(dataset, dataset_name, model):
 
 
 # get factuals from the data to generate counterfactual examples
-def get_factuals(model, dataset, random=False, sample=None):
+def get_factuals(model, dataset):
     factuals = predict_negative_instances(model, dataset.df)
     return factuals
 
@@ -185,13 +212,58 @@ def kmeans(df):
     return pd.DataFrame(centers[kn.knee-1])
 
 
+def mmd_linear(X, Y):
+    XX = np.dot(X, X.T)
+    YY = np.dot(Y, Y.T)
+    XY = np.dot(X, Y.T)
+    return XX.mean() + YY.mean() - 2 * XY.mean()
 
-def measurements(model, dataset, filename, counterfactuals, features, round, name):
+
+def disagreement_coefficient(original_model, modified_model, modified_dataset):
+    original_prediction = (original_model.predict(modified_dataset._df) > 0.5).flatten()
+    modified_prediction = (modified_model.predict(modified_dataset._df) > 0.5).flatten()
+    
+    correct = original_prediction != modified_prediction
+    return correct.sum()/len(original_prediction)
+
+
+def measurements(model, original_model, dataset, original_dataset, filename, counterfactuals, features, round, name):
+
+    df = dataset.df.drop(columns=[dataset.target] ,inplace=False)
+    # contour plot
+    min1, max1 = df["feature1"].min()-1, df["feature1"].max()+1
+    min2, max2 = df["feature2"].min()-1, df["feature2"].max()+1
+
+    x1grid = np.linspace(min1, max1, 100)
+    x2grid = np.linspace(min2, max2, 100)
+
+    xx, yy = np.meshgrid(x1grid, x2grid)
+
+    r1, r2 = xx.flatten(), yy.flatten()
+    r1, r2 = r1.reshape((len(r1), 1)), r2.reshape((len(r2), 1))
+    
+    grid = np.hstack((r1,r2))
+    yhat = model.predict(grid)
+    original_yhat = original_model.predict(grid)
+
+    zz = yhat.reshape(xx.shape)
+    # end contour plot
+
 
     res = {
         "Count": counterfactuals.shape[0], 
         "Accuracy": model.get_test_accuracy(), 
-        "F1-score": model.get_F1_score()
+        "F1-score": model.get_F1_score(),
+        "MMD probabilities": mmd_linear(
+            original_model.predict(dataset._df.loc[:, dataset._df.columns != dataset.target]), 
+            model.predict(dataset._df.loc[:, dataset._df.columns != dataset.target])
+            ),
+        "MMD domain": mmd_linear(
+            dataset._df.loc[:, dataset._df.columns != dataset.target], 
+            original_dataset._df.loc[:, original_dataset._df.columns != original_dataset.target]
+            ),
+        "MMD model": mmd_linear(yhat, original_yhat),
+        "Disagreement": disagreement_coefficient(original_model, model, dataset)
     }
 
     negative = dataset._df[dataset._df[dataset.target] == 0].drop(columns=[dataset.target])
@@ -202,31 +274,9 @@ def measurements(model, dataset, filename, counterfactuals, features, round, nam
     for x in features:
         res[f"mean negative {x}"] = negative[x].mean()
         res[f"mean positive {x}"] = positive[x].mean()
-        res[f"median negative {x}"] = negative[x].median()
-        res[f"median positive {x}"] = positive[x].median()
 
-    df = dataset.df.drop(columns=[dataset.target] ,inplace=False)
     kmeans_centers = kmeans(df)
 
-    # contour plot
-    min1, max1 = df["feature 1"].min()-1, df["feature 1"].max()+1
-    min2, max2 = df["feature 2"].min()-1, df["feature 2"].max()+1
-
-    x1grid = np.linspace(min1, max1, 100)
-    x2grid = np.linspace(min2, max2, 100)
-
-    xx, yy = np.meshgrid(x1grid, x2grid)
-
-    print(xx.shape)
-
-    r1, r2 = xx.flatten(), yy.flatten()
-    r1, r2 = r1.reshape((len(r1), 1)), r2.reshape((len(r2), 1))
-    
-    grid = np.hstack((r1,r2))
-    yhat = model.predict(grid)
-
-    zz = yhat.reshape(xx.shape)
-    # end contour plot
 
     fig, ax = plt.subplots()
 
@@ -236,14 +286,14 @@ def measurements(model, dataset, filename, counterfactuals, features, round, nam
     plt.xlim([-0.1, 1.1])
     plt.ylim([-0.1, 1.1])
     plt.contourf(xx, yy, zz, cmap="GnBu")
+    plt.clim(0, 1)
     cb = plt.colorbar()
     cb.set_label("probability")
-    plt.clim(0, 1)
-    plt.scatter(dataset._df["feature 1"].tolist(), dataset._df["feature 2"].tolist(), c=dataset._df["class"])
+    plt.scatter(dataset._df["feature1"].tolist(), dataset._df["feature2"].tolist(), c=dataset._df["target"])
     kmeans_centers.plot.scatter(x=0, y=1, ax=ax, marker="*", c="red")
     ax.set_title(f'Scatterplot {filename} {name} {round}')
-    ax.set_xlabel("Feature 1")
-    ax.set_ylabel("Feature 2")
+    ax.set_xlabel("Feature1")
+    ax.set_ylabel("Feature2")
     fig.savefig(f"{filename}_{name}_{round}.png")
     plt.close()
 
@@ -254,14 +304,14 @@ def measurements(model, dataset, filename, counterfactuals, features, round, nam
     return pd.Series(res)
 
 
-def run_rounds(df_res, rounds, batch, model, dataset, factuals, recourse_function, recourse_name, filename):    
+def run_rounds(df_res, rounds, batch, model, original_model, dataset, original_dataset, factuals, recourse_function, recourse_name, filename):    
     for i in range(1, rounds+1):
         recourse = recourse_function(dataset, "custom", model)
 
         try:
             (counterfactuals, count) = run_recourse_method(factuals, recourse, recourse_name)
         except ValueError:
-            logger.error(f"retrying retrieval of counterfactuals because of an error with the model")
+            logger.error(f"error with the retrieval of counterfactuals")
 
         # print(count)
         counterfactuals["factual_id"] = factuals.index
@@ -286,16 +336,15 @@ def run_rounds(df_res, rounds, batch, model, dataset, factuals, recourse_functio
 
 
         dataset, features = read_dataset(f"{filename}-{recourse_name}-{i}")
-        dataset = CsvCatalog(file_path=f"{filename}-{recourse_name}-{i}", continuous=features, categorical=[], immutables=[], target="class")
+        dataset = CsvCatalog(file_path=f"{filename}-{recourse_name}-{i}", continuous=features, categorical=[], immutables=[], target="target")
         model.data = dataset
         model.train(
-            learning_rate=training_params["lr"],
-            epochs=training_params["epochs"],
-            batch_size=training_params["batch_size"],
-            hidden_size=training_params["hidden_size"],
+            learning_rate=gs.best_params_['lr'],
+            epochs=gs.best_params_['max_epochs'],
+            batch_size=gs.best_params_['batch_size'],
         )
 
-        res = measurements(model, dataset, filename, counterfactuals, features, round=i, name=recourse_name)
+        res = measurements(model, original_model, dataset, original_dataset, filename, counterfactuals, features, round=i, name=recourse_name)
         df_res = df_res.append(res, ignore_index=True)
         factuals = get_factuals(model, dataset)
     
@@ -327,7 +376,7 @@ def main():
 
         df_revise = pd.DataFrame()
         df_wachter = pd.DataFrame()
-        res = measurements(model, dataset, args.model, pd.DataFrame(), features, round=0, name="Start")
+        res = measurements(model, model, dataset, dataset, args.model, pd.DataFrame(), features, round=0, name="Start")
 
         df_revise = df_revise.append(res, ignore_index=True)
         df_wachter = df_wachter.append(res, ignore_index=True)
@@ -336,16 +385,16 @@ def main():
         dataset_revise = copy.deepcopy(dataset)
         revise_model = copy.deepcopy(model)
         revise_factuals = get_factuals(revise_model, dataset_revise)
-        df_revise = run_rounds(df_revise, args.rounds, args.batch, revise_model, dataset_revise, revise_factuals, load_revise, "REVISE", args.model)
-        df_revise.to_csv(f'df_revise_{args.model}.csv', sep=',', encoding='utf-8', index=False)
+        df_revise = run_rounds(df_revise, args.rounds, args.batch, revise_model, model, dataset_revise, dataset, revise_factuals, load_revise, "REVISE", args.model)
+        df_revise.to_csv(f'{args.model}_df_revise.csv', sep=',', encoding='utf-8', index=False)
         logger.debug("done with revise")
 
         logger.debug("starting wachter")
         wachter_dataset = copy.deepcopy(dataset)
         wachter_model = copy.deepcopy(model)
         wachter_factuals = get_factuals(wachter_model, wachter_dataset)
-        df_wachter = run_rounds(df_wachter, args.rounds, args.batch, wachter_model, wachter_dataset, wachter_factuals, load_wachter, "Wachter", args.model)
-        df_wachter.to_csv(f'df_wachter_{args.model}.csv', sep=',', encoding='utf-8', index=False)
+        df_wachter = run_rounds(df_wachter, args.rounds, args.batch, wachter_model, model, wachter_dataset, dataset, wachter_factuals, load_wachter, "Wachter", args.model)
+        df_wachter.to_csv(f'{args.model}_df_wachter.csv', sep=',', encoding='utf-8', index=False)
         logger.debug("done with wachter")
 
         end = time.time()

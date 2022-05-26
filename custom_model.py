@@ -1,3 +1,4 @@
+from tabnanny import verbose
 from carla.models.api import MLModel
 from carla.data.catalog.online_catalog import DataCatalog
 from typing import Any, List, Union
@@ -9,21 +10,31 @@ from torch.utils.data import DataLoader, Dataset
 from sklearn.metrics import f1_score
 
 from carla.models.catalog.load_model import save_model
-from carla.models.catalog.train_model import train_model, _training_torch, DataFrameDataset
+from carla.models.catalog.train_model import train_model, DataFrameDataset
+
+from carla.models.catalog.ANN_TORCH import AnnModel as ann_torch
+
+from sklearn.model_selection import GridSearchCV
+from skorch import NeuralNetClassifier
+
+import copy
 
 class CustomModel(MLModel):
     
     def __init__(self,
         data: DataCatalog,
-        model_type: str,
         backend: str = "pytorch",
         models_home: str = "./models/",
+        hidden_size=[18, 9, 3],
+        model=None,
         **kws,
     ):
-        self._model_type = model_type
+
+        self._model_type = "ann"
         self._backend = backend
         self._continuous = data.continuous
         self._categorical = data.categorical
+        self._hidden_size = hidden_size
         
         super().__init__(data)
 
@@ -39,8 +50,11 @@ class CustomModel(MLModel):
             np.sort(data.continuous + encoded_features)
         )
 
-        self._model = None
-
+        self._model = ann_torch(
+            input_layer=len(self.data.df_test.columns)-1,
+            hidden_layers=hidden_size,
+            num_of_classes=2,
+        )
 
     @property
     def model_type(self) -> str:
@@ -190,6 +204,7 @@ class CustomModel(MLModel):
         correct = prediction == y_test
         return correct.mean()
 
+
     def get_F1_score(self):
         df_test = self.data.df_test
 
@@ -200,15 +215,77 @@ class CustomModel(MLModel):
 
         return f1_score(y_test, prediction)
 
+
+    def training_torch(
+        self,
+        train_loader,
+        test_loader,
+        learning_rate,
+        epochs,
+    ):
+        loaders = {"train": train_loader, "test": test_loader}
+
+        # Use GPU is available
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        model = self._model.to(device)
+
+        # define the loss
+        criterion = nn.BCELoss()
+
+        # declaring optimizer
+        optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate)
+
+        # training
+        for e in range(epochs):
+            # print("Epoch {}/{}".format(e, epochs - 1))
+            # print("-" * 10)
+
+            # Each epoch has a training and validation phase
+            for phase in ["train", "test"]:
+
+                running_loss = 0.0
+                running_corrects = 0.0
+
+                if phase == "train":
+                    model.train()  # Set model to training mode
+                else:
+                    model.eval()  # Set model to evaluation mode
+
+                for i, (inputs, labels) in enumerate(loaders[phase]):
+                    inputs = inputs.to(device)
+                    labels = labels.to(device).type(torch.int64)
+                    labels = torch.nn.functional.one_hot(labels, num_classes=2)
+
+                    optimizer.zero_grad()
+
+                    with torch.set_grad_enabled(phase == "train"):
+                        outputs = model(inputs.float())
+                        loss = criterion(outputs, labels.float())
+
+                        # backward + optimize only if in training phase
+                        if phase == "train":
+                            loss.backward()
+                            optimizer.step()
+
+                    # statistics
+                    running_loss += loss.item() * inputs.size(0)
+                    running_corrects += torch.sum(
+                        torch.argmax(outputs, axis=1)
+                        == torch.argmax(labels, axis=1).float()
+                    )
+
+                epoch_loss = running_loss / len(loaders[phase].dataset)
+                epoch_acc = running_corrects.double() / len(loaders[phase].dataset)
+
+                # print("{} Loss: {:.4f} Acc: {:.4f}".format(phase, epoch_loss, epoch_acc))
+                # print()
+
+
     def train(
-    self,
-    learning_rate=None,
-    epochs=None,
-    batch_size=None,
-    hidden_size=[18, 9, 3],
-    n_estimators=5,
-    max_depth=5,
-    force_train=False
+        self,
+        learning_rate=None,
+        epochs=None,
+        batch_size=None,
     ):
         """
         Parameters
@@ -232,13 +309,8 @@ class CustomModel(MLModel):
         Returns
         -------
         """
-        layer_string = "_".join([str(size) for size in hidden_size])
-        if self.model_type == "linear" or self.model_type == "forest":
-            save_name = f"{self.model_type}"
-        elif self.model_type == "ann":
-            save_name = f"{self.model_type}_layers_{layer_string}"
-        else:
-            raise NotImplementedError("Model type not supported:", self.model_type)
+        layer_string = "_".join([str(size) for size in self._hidden_size])
+        save_name = f"{self.model_type}_layers_{layer_string}"
 
         df_train = self.data.df_train
         df_test = self.data.df_test
@@ -252,46 +324,26 @@ class CustomModel(MLModel):
         x_train = self.get_ordered_features(x_train)
         x_test = self.get_ordered_features(x_test)
 
-        # if model loading failed or force_train flag set to true.
-        if self._model is None or force_train:
-            self._model = train_model(
-                self,
-                x_train,
-                y_train,
-                x_test,
-                y_test,
-                learning_rate,
-                epochs,
-                batch_size,
-                hidden_size,
-                n_estimators,
-                max_depth,
-            )
+        print("Finetuning model")
+        train_dataset = DataFrameDataset(x_train, y_train)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        test_dataset = DataFrameDataset(x_test, y_test)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
 
-            save_model(
-                model=self._model,
-                save_name=save_name,
-                data_name=self.data.name,
-                backend=self.backend,
-            )
-        else:
-            print("Finetuning model")
-            train_dataset = DataFrameDataset(x_train, y_train)
-            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-            test_dataset = DataFrameDataset(x_test, y_test)
-            test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
+        self.training_torch(
+            train_loader,
+            test_loader,
+            learning_rate,
+            epochs,
+        )
 
-            _training_torch(
-                self._model,
-                train_loader,
-                test_loader,
-                learning_rate,
-                epochs,
-            )
+        save_model(
+            model=self._model,
+            save_name=save_name,
+            data_name=self.data.name,
+            backend=self.backend,
+        )
 
-            save_model(
-                model=self._model,
-                save_name=save_name,
-                data_name=self.data.name,
-                backend=self.backend,
-            )
+
+
+
