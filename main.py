@@ -1,5 +1,4 @@
-# from asyncore import file_dispatcher
-# from fileinput import filename
+
 from dis import dis
 import warnings
 import os
@@ -15,12 +14,14 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 from carla.data.catalog import OnlineCatalog, CsvCatalog
 from carla import MLModelCatalog
 from custom_model import CustomModel
+from custom_linear_model import CustomLinearModel
+from synthetic_dataset import SyntheticDatasetGenerator as SDG
+from measurements import Measurements
 from carla.recourse_methods import Revise
 from carla.recourse_methods import Wachter
 from carla.models.negative_instances import predict_negative_instances
 
 from scipy.special import rel_entr
-from sklearn.datasets import make_classification
 from sklearn.metrics import classification_report
 import numpy as np
 import matplotlib.pyplot as plt
@@ -31,12 +32,12 @@ from sklearn.cluster import KMeans
 from kneed import KneeLocator
 
 from carla.models.catalog.ANN_TORCH import AnnModel as ann_torch
+from carla.models.catalog.Linear_TORCH.model_linear import LinearModel as linear
+
 # from custom_model_ann import CustomAnnModel as ann_torch
 
 from sklearn.model_selection import GridSearchCV
 from skorch import NeuralNetClassifier
-
-from itertools import combinations
 
 import copy
 import argparse
@@ -50,34 +51,6 @@ fh.setFormatter(formatter)
 fh.setLevel(logging.DEBUG)
 logger.addHandler(fh)
 
-def create_dataset(dataset_name, num):
-    dataset, label = make_classification(n_samples=num, n_features=2, n_informative=2, n_redundant=0, n_clusters_per_class=1, flip_y=0, class_sep=2)
-
-    feature_labels = ["feature1", "feature2"]
-
-    df = pd.DataFrame(dataset, columns=feature_labels)
-    df = normalize_dataset(df, feature_labels)
-
-
-    plt.scatter(df["feature1"].tolist(), df["feature2"].tolist(), c=label)
-    plt.xlabel("Feature1")
-    plt.ylabel("Feature2")
-    plt.savefig(f"{dataset_name}_scatterplot.png")
-
-    df["target"] = label
-
-    df.to_csv(dataset_name, sep=',', encoding='utf-8', index=False)
-
-    logger.debug(f"Saved created dataset to csv: {dataset_name}")
-
-
-def normalize_dataset(dataset, features):
-    min_val = dataset.min()
-    for f in features:
-        dataset[f] = dataset[f].apply(lambda x: x - min_val[f])
-    dataset = (dataset-dataset.min())/(dataset.max()-dataset.min())
-    return dataset
-
 # reads the csv containing the data, assumes that the last column is the target and not a feature
 def read_dataset(filename):
     dataset = pd.read_csv(filename)
@@ -86,26 +59,62 @@ def read_dataset(filename):
     return (dataset, features)
 
 
-def load_custom_dataset_model(filename):
+def load_custom_dataset_model(filename, model_type):
 
     dataset, features = read_dataset(filename)
+    print(dataset)
     dataset = CsvCatalog(file_path=filename, continuous=features, categorical=[], immutables=[], target="target")
 
-    net = NeuralNetClassifier(
-        module=ann_torch,
-        module__input_layer=len(dataset._df_test.columns)-1,
-        module__hidden_layers=[4],
-        module__num_of_classes=2,
-        lr=0.01,
-        # Shuffle training data on each epoch
-        iterator_train__shuffle=True,
-    )
+    print(dataset._df)
+
+    hidden_layers = [4]
+
+    net = None 
+    model = None
 
     parameters = {
         'lr': [0.005, 0.01, 0.02, 0.05, 0.1],
         'max_epochs': [10, 20, 30, 40, 50],
         'batch_size': [1, 5, 10, 20, 40]
     }
+
+    if model_type == 'linear':
+
+        net = NeuralNetClassifier(
+            module=linear,
+            module__dim_input=len(dataset._df_test.columns)-1,
+            # module__hidden_layers=hidden_layers,
+            module__num_of_classes=2,
+            lr=0.01,
+            # Shuffle training data on each epoch
+            iterator_train__shuffle=True,
+        )
+        model = CustomLinearModel(dataset, model_type="linear", backend="pytorch", load_online=False, cache=False)
+
+    elif model_type == 'ann1':
+        net = NeuralNetClassifier(
+            module=ann_torch,
+            module__input_layer=len(dataset._df_test.columns)-1,
+            module__hidden_layers=hidden_layers,
+            module__num_of_classes=2,
+            lr=0.01,
+            # Shuffle training data on each epoch
+            iterator_train__shuffle=True,
+        )
+        model = CustomModel(dataset, model_type="linear", backend="pytorch", load_online=False, cache=False, hidden_size=hidden_layers)
+    
+    elif model_type == 'ann2':
+        hidden_layers = [8, 4]
+        net = NeuralNetClassifier(
+            module=ann_torch,
+            module__input_layer=len(dataset._df_test.columns)-1,
+            module__hidden_layers=hidden_layers,
+            module__num_of_classes=2,
+            lr=0.01,
+            # Shuffle training data on each epoch
+            iterator_train__shuffle=True,
+        )
+        model = CustomModel(dataset, model_type="linear", backend="pytorch", load_online=False, cache=False, hidden_size=hidden_layers)
 
     global gs
     gs = GridSearchCV(estimator=net, param_grid=parameters, cv=2, scoring='accuracy', verbose=0, n_jobs=-1)
@@ -116,8 +125,6 @@ def load_custom_dataset_model(filename):
     gs.fit(np.array(X, dtype=np.float32), y)
 
     logger.debug(f"Best parameters set found on development set: {gs.best_params_}")
-
-    model = CustomModel(dataset, model_type="ann", backend="pytorch", load_online=False, cache=False, hidden_size=[4])
 
     # logger.debug(classification_report(y_true, y_pred))
 
@@ -141,7 +148,7 @@ def load_revise(dataset, dataset_name, model):
     hyperparams = {
         "data_name": dataset_name, 
         "vae_params": {
-            "train": False,
+            "train": True,
             "layers": [len(model.feature_input_order), 512, 256, 8],
         }
     }
@@ -163,19 +170,6 @@ def get_factuals(model, dataset):
     return factuals
 
 
-def norm_model_prob(model, input):
-    output = np.nan_to_num(model.predict(input))
-    # normalize output vector
-    output /= np.sum(output)
-    return output
-
-
-def kl_divergence( base_model, modified_model):
-    # retrieve the KL Divergence by summing the relative entropy of two probabilities
-    vec = rel_entr(base_model, modified_model)
-    return np.sum(vec)
-
-
 def run_recourse_method(factuals, recourse_method, recourse_name):
     start = time.time()
     counterfactuals = recourse_method.get_counterfactuals(factuals)
@@ -188,123 +182,8 @@ def run_recourse_method(factuals, recourse_method, recourse_name):
     return (counterfactuals, count)
 
 
-def kmeans(df):
-    mms = MinMaxScaler()
-    mms.fit(df)
-    data_transformed = mms.transform(df)
 
-    ssd = []
-    K = 7
-    centers = []
-    for k in range(1, K):
-        km = KMeans(n_clusters=k)
-        km = km.fit(data_transformed)
-        ssd.append(km.inertia_)
-        centers.append(km.cluster_centers_)
-
-    x = range(1, K)
-
-    logger.debug(f"{len(ssd)} {len(x)}")
-
-    kn = KneeLocator(x, ssd, curve='convex', direction='decreasing')
-    logger.debug(f"\'Optimal\' amount of clusters found: {kn.knee}")
-
-    return pd.DataFrame(centers[kn.knee-1])
-
-
-def mmd_linear(X, Y):
-    XX = np.dot(X, X.T)
-    YY = np.dot(Y, Y.T)
-    XY = np.dot(X, Y.T)
-    return XX.mean() + YY.mean() - 2 * XY.mean()
-
-
-def disagreement_coefficient(original_model, modified_model, modified_dataset):
-    original_prediction = (original_model.predict(modified_dataset._df) > 0.5).flatten()
-    modified_prediction = (modified_model.predict(modified_dataset._df) > 0.5).flatten()
-    
-    correct = original_prediction != modified_prediction
-    return correct.sum()/len(original_prediction)
-
-
-def measurements(model, original_model, dataset, original_dataset, filename, counterfactuals, features, round, name):
-
-    df = dataset.df.drop(columns=[dataset.target] ,inplace=False)
-    # contour plot
-    min1, max1 = df["feature1"].min()-1, df["feature1"].max()+1
-    min2, max2 = df["feature2"].min()-1, df["feature2"].max()+1
-
-    x1grid = np.linspace(min1, max1, 100)
-    x2grid = np.linspace(min2, max2, 100)
-
-    xx, yy = np.meshgrid(x1grid, x2grid)
-
-    r1, r2 = xx.flatten(), yy.flatten()
-    r1, r2 = r1.reshape((len(r1), 1)), r2.reshape((len(r2), 1))
-    
-    grid = np.hstack((r1,r2))
-    yhat = model.predict(grid)
-    original_yhat = original_model.predict(grid)
-
-    zz = yhat.reshape(xx.shape)
-    # end contour plot
-
-
-    res = {
-        "Count": counterfactuals.shape[0], 
-        "Accuracy": model.get_test_accuracy(), 
-        "F1-score": model.get_F1_score(),
-        "MMD probabilities": mmd_linear(
-            original_model.predict(dataset._df.loc[:, dataset._df.columns != dataset.target]), 
-            model.predict(dataset._df.loc[:, dataset._df.columns != dataset.target])
-            ),
-        "MMD domain": mmd_linear(
-            dataset._df.loc[:, dataset._df.columns != dataset.target], 
-            original_dataset._df.loc[:, original_dataset._df.columns != original_dataset.target]
-            ),
-        "MMD model": mmd_linear(yhat, original_yhat),
-        "Disagreement": disagreement_coefficient(original_model, model, dataset)
-    }
-
-    negative = dataset._df[dataset._df[dataset.target] == 0].drop(columns=[dataset.target])
-    positive = dataset._df[dataset._df[dataset.target] == 1].drop(columns=[dataset.target])
-
-    # calc mean, cov ...
-    # print(negative)
-    for x in features:
-        res[f"mean negative {x}"] = negative[x].mean()
-        res[f"mean positive {x}"] = positive[x].mean()
-
-    kmeans_centers = kmeans(df)
-
-
-    fig, ax = plt.subplots()
-
-    fig.set_size_inches(10, 7.5)
-    fig.set_dpi(300)
-    
-    plt.xlim([-0.1, 1.1])
-    plt.ylim([-0.1, 1.1])
-    plt.contourf(xx, yy, zz, cmap="GnBu")
-    plt.clim(0, 1)
-    cb = plt.colorbar()
-    cb.set_label("probability")
-    plt.scatter(dataset._df["feature1"].tolist(), dataset._df["feature2"].tolist(), c=dataset._df["target"])
-    kmeans_centers.plot.scatter(x=0, y=1, ax=ax, marker="*", c="red")
-    ax.set_title(f'Scatterplot {filename} {name} {round}')
-    ax.set_xlabel("Feature1")
-    ax.set_ylabel("Feature2")
-    fig.savefig(f"{filename}_{name}_{round}.png")
-    plt.close()
-
-    kmeans_centers.to_csv(f'{filename}_{name}_{round}_kmeans_centers.csv', sep=',', encoding='utf-8', index=False)
-    df.cov().to_csv(f'{filename}_{name}_{round}_cov.csv', sep=',', encoding='utf-8', index=False)
-
-    logger.debug(f"{name} {res}")
-    return pd.Series(res)
-
-
-def run_rounds(df_res, rounds, batch, model, original_model, dataset, original_dataset, factuals, recourse_function, recourse_name, filename):    
+def run_rounds(df_res, measurement, rounds, batch, model, dataset, factuals, recourse_function, recourse_name, filename):    
     for i in range(1, rounds+1):
         recourse = recourse_function(dataset, "custom", model)
 
@@ -313,12 +192,9 @@ def run_rounds(df_res, rounds, batch, model, original_model, dataset, original_d
         except ValueError:
             logger.error(f"error with the retrieval of counterfactuals")
 
-        # print(count)
         counterfactuals["factual_id"] = factuals.index
         counterfactuals.set_index("factual_id", inplace=True, drop=True)
         counterfactuals.dropna(inplace=True)
-        # print(revise_counterfactuals)
-        # print(revise_factuals)
 
         if (counterfactuals.shape[0] >= batch):
             
@@ -327,12 +203,11 @@ def run_rounds(df_res, rounds, batch, model, original_model, dataset, original_d
             logger.debug(f"Counterfactuals added: {samples.shape[0]}")
             df.index.name = "factual_id"
             df.loc[samples.index, :] = samples[:]
-            # print(df.loc[samples.index[0]])
-            # print(df.loc[samples.index])
+
 
             df.to_csv(f"{filename}-{recourse_name}-{i}", sep=',', encoding='utf-8', index=False)
         else:
-            logger.debug(f"not enough counterfactuals to use with {recourse_name} to complete all rounds")
+            logger.debug(f"not enough counterfactuals to use with {recourse_name} to complete all rounds {counterfactuals.shape}")
 
 
         dataset, features = read_dataset(f"{filename}-{recourse_name}-{i}")
@@ -344,7 +219,7 @@ def run_rounds(df_res, rounds, batch, model, original_model, dataset, original_d
             batch_size=gs.best_params_['batch_size'],
         )
 
-        res = measurements(model, original_model, dataset, original_dataset, filename, counterfactuals, features, round=i, name=recourse_name)
+        res = measurement.measure(model, dataset, filename, counterfactuals, features, round=i, name=recourse_name)
         df_res = df_res.append(res, ignore_index=True)
         factuals = get_factuals(model, dataset)
     
@@ -357,13 +232,15 @@ def main():
     parser.add_argument('-d', '--dataset', help="create an artificial dataset using the given name")
     parser.add_argument('-n', '--num', default=200, type=int, help="number of datapoints for custom dataset")
     parser.add_argument('-m', '--model', help="filename of the dataset to train the model on")
+    parser.add_argument('-t', '--type', help="model type (linear, ann1 or ann2)")
     parser.add_argument('-b', '--batch', default=5, type=int, help="batch size of added counterfactuals per round")
     parser.add_argument('-r', '--rounds', default=5, type=int, help="amount of rounds to add counterfactuals and retrain the model")
 
     args = parser.parse_args()
 
     if args.dataset:
-        create_dataset(args.dataset, args.num)
+        sdg = SDG(logger)
+        sdg.generate(args.dataset, args.num)
 
     if args.custom:
 
@@ -371,12 +248,15 @@ def main():
 
         logger.debug("process started")
 
-        dataset, model, features = load_custom_dataset_model(args.model)
+        dataset, model, features = load_custom_dataset_model(args.model, args.type)
         logger.debug(hash(model))
 
         df_revise = pd.DataFrame()
         df_wachter = pd.DataFrame()
-        res = measurements(model, model, dataset, dataset, args.model, pd.DataFrame(), features, round=0, name="Start")
+        measure_revise = Measurements(logger, model, dataset)
+        measure_wachter = Measurements(logger, model, dataset)
+
+        res = measure_revise.measure(model, dataset, args.model, pd.DataFrame(), features, round=0, name="Start")
 
         df_revise = df_revise.append(res, ignore_index=True)
         df_wachter = df_wachter.append(res, ignore_index=True)
@@ -385,7 +265,7 @@ def main():
         dataset_revise = copy.deepcopy(dataset)
         revise_model = copy.deepcopy(model)
         revise_factuals = get_factuals(revise_model, dataset_revise)
-        df_revise = run_rounds(df_revise, args.rounds, args.batch, revise_model, model, dataset_revise, dataset, revise_factuals, load_revise, "REVISE", args.model)
+        df_revise = run_rounds(df_revise, measure_revise, args.rounds, args.batch, revise_model, dataset_revise, revise_factuals, load_revise, "REVISE", args.model)
         df_revise.to_csv(f'{args.model}_df_revise.csv', sep=',', encoding='utf-8', index=False)
         logger.debug("done with revise")
 
@@ -393,7 +273,7 @@ def main():
         wachter_dataset = copy.deepcopy(dataset)
         wachter_model = copy.deepcopy(model)
         wachter_factuals = get_factuals(wachter_model, wachter_dataset)
-        df_wachter = run_rounds(df_wachter, args.rounds, args.batch, wachter_model, model, wachter_dataset, dataset, wachter_factuals, load_wachter, "Wachter", args.model)
+        df_wachter = run_rounds(df_wachter, measure_wachter, args.rounds, args.batch, wachter_model, wachter_dataset, wachter_factuals, load_wachter, "Wachter", args.model)
         df_wachter.to_csv(f'{args.model}_df_wachter.csv', sep=',', encoding='utf-8', index=False)
         logger.debug("done with wachter")
 
